@@ -61,7 +61,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let root = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]).with_min_inner_size([1060.0, 680.0]), ..Default::default() };
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]).with_min_inner_size([820.0, 560.0]).with_resizable(true), ..Default::default() };
     eframe::run_native("PacketTool - 热点抓包", options, Box::new(move |cc| {
         let mut fonts = FontDefinitions::default();
         if let Ok(data) = fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
@@ -405,19 +405,19 @@ impl eframe::App for CaptureApp {
             ui.add_space(3.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{} {}  ·  {} {}  ·  {} {}", if self.imported { tr(en,"文件记录","File records") } else { tr(en,"已捕获","Captured") }, self.packet_count, tr(en,"窗口保留","In view"), self.packets.len(), tr(en,"跳过非 IPv4","Non-IPv4 skipped"), self.skipped));
                 ui.separator(); ui.label(tr(en,"完整数据保存在 PCAP  ·  域名不能确定 App  ·  HTTPS 通常加密","Full capture saved to PCAP · Domains do not identify apps · HTTPS is usually encrypted"));
             });
         });
-        egui::SidePanel::left("packets").resizable(true).default_width(455.0).min_width(330.0).show(ctx, |ui| {
+        egui::SidePanel::left("packets").resizable(true).default_width(340.0).min_width(260.0).show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| { ui.heading(tr(en,"数据包列表","Packets")); ui.label(RichText::new(format!("{} / {}", self.packets.len(), self.packet_count)).color(muted)); });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.show_flows, false, tr(en,"数据包","Packets"));
                 ui.selectable_value(&mut self.show_flows, true, tr(en,"连接","Connections"));
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_id_salt("category").selected_text(local_category(en, &self.filter)).show_ui(ui, |ui| {
                     for category in ["全部", "DNS", "HTTP（可能）", "TLS/HTTPS（可能）", "UDP 443（可能为 QUIC）", "TCP", "UDP", "ICMP", "其他"] {
                         ui.selectable_value(&mut self.filter, category.to_owned(), local_category(en, category));
@@ -490,14 +490,15 @@ impl eframe::App for CaptureApp {
                     ui.set_min_width(ui.available_width());
                     egui::CollapsingHeader::new(RichText::new(tr(en,"协议详情","Protocol details")).strong()).default_open(true).show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("details").max_height(120.0).show(ui, |ui| {
-                            egui::Grid::new("detail_grid").num_columns(4).spacing([18.0, 4.0]).show(ui, |ui| {
+                            let columns = if ui.available_width() < 590.0 { 2 } else { 4 };
+                            egui::Grid::new("detail_grid").num_columns(columns).spacing([18.0, 4.0]).show(ui, |ui| {
                                 let info = if en { translate_detail(&packet.info) } else { packet.info.clone() };
                                 for (index, line) in info.lines().enumerate() {
                                     if let Some((key, value)) = line.split_once('：') {
                                         ui.label(RichText::new(key).color(muted));
                                         ui.label(value);
                                     } else { ui.label(""); ui.label(line); }
-                                    if index % 2 == 1 { ui.end_row(); }
+                                    if columns == 2 || index % 2 == 1 { ui.end_row(); }
                                 }
                             });
                         });
@@ -508,14 +509,12 @@ impl eframe::App for CaptureApp {
                 let payload_offset = metadata::payload_offset(&bytes);
                 let view_offset = if self.payload_only { payload_offset.unwrap_or(bytes.len()) } else { 0 };
                 let view_bytes = &bytes[view_offset..];
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.heading(tr(en,"数据内容","Packet data")); ui.label(RichText::new(format!("{} {}", view_bytes.len(), tr(en,"字节","bytes"))).color(muted));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(tr(en,"设为 B","Set as B")).clicked() { self.compare_b = Some((packet.id, bytes.clone())); self.show_compare = true; }
                         if ui.button(tr(en,"设为 A","Set as A")).clicked() { self.compare_a = Some((packet.id, bytes.clone())); self.show_compare = true; }
+                        if ui.button(tr(en,"设为 B","Set as B")).clicked() { self.compare_b = Some((packet.id, bytes.clone())); self.show_compare = true; }
                         if ui.button(tr(en,"复制十六进制","Copy hex bytes")).clicked() { ctx.copy_text(view_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")); }
                         if ui.button(tr(en,"复制当前视图","Copy view")).clicked() { ctx.copy_text(if self.text_view { render_text(view_bytes) } else { render_hex_at(view_bytes, view_offset) }); }
-                    });
                 });
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.text_view, false, tr(en,"十六进制 / ASCII","Hex / ASCII"));
