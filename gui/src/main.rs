@@ -1,12 +1,13 @@
 #![windows_subsystem = "windows"]
 mod metadata;
 mod mcp;
+mod pcap;
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText};
 use std::fs;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,6 +21,28 @@ extern "system" {
 }
 #[link(name = "user32")]
 extern "system" { fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32; }
+#[repr(C)]
+struct OpenFileName {
+    size: u32, owner: isize, instance: isize, filter: *const u16, custom_filter: *mut u16,
+    custom_filter_size: u32, filter_index: u32, file: *mut u16, max_file: u32,
+    file_title: *mut u16, max_file_title: u32, initial_dir: *const u16, title: *const u16,
+    flags: u32, file_offset: u16, extension_offset: u16, default_ext: *const u16,
+    custom_data: isize, hook: isize, template: *const u16, reserved: *mut std::ffi::c_void,
+    reserved_u32: u32, flags_ex: u32,
+}
+#[link(name = "comdlg32")]
+extern "system" { fn GetOpenFileNameW(ofn: *mut OpenFileName) -> i32; }
+fn choose_pcap() -> Option<PathBuf> {
+    let filter: Vec<u16> = "PCAP files (*.pcap)\0*.pcap\0All files (*.*)\0*.*\0\0".encode_utf16().collect();
+    let mut path = vec![0u16; 32768];
+    let mut dialog: OpenFileName = unsafe { std::mem::zeroed() };
+    dialog.size = std::mem::size_of::<OpenFileName>() as u32;
+    dialog.filter = filter.as_ptr(); dialog.file = path.as_mut_ptr(); dialog.max_file = path.len() as u32;
+    dialog.flags = 0x0008 | 0x0800 | 0x1000 | 0x80000;
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 { return None; }
+    let len = path.iter().position(|&x| x == 0)?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&path[..len])))
+}
 
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() }
 fn message(s: &str) {
@@ -71,7 +94,7 @@ fn main() -> eframe::Result {
     }))
 }
 
-enum Event { Line(String), Finished(String) }
+enum Event { Line(String), Finished(String), Imported(PathBuf, Result<pcap::Loaded, String>) }
 #[derive(Clone, PartialEq)]
 struct Settings { dark: bool, english: bool, zoom: f32, font_size: f32, packet_limit: usize }
 impl Default for Settings {
@@ -149,7 +172,7 @@ fn translate_detail(s: &str) -> String {
     for (zh, en) in [("来源 IP", "Source IP"), ("目标 IP", "Destination IP"), ("IP 包长", "IP packet length"), ("IP 头长", "IP header length"), ("来源端口", "Source port"), ("目标端口", "Destination port"), ("传输协议", "Transport protocol"), ("传输头长", "Transport header length"), ("本包载荷", "Packet payload"), ("TCP 标志", "TCP flags"), ("协议号", "Protocol number"), ("DNS 关联（可能不唯一）", "DNS association (may be shared)"), ("字节", "bytes"), ("无", "None")] { text = text.replace(zh, en); }
     text
 }
-struct Packet { id: u64, summary: String, hex: String, detail: String, category: &'static str, info: String, protocol: u8 }
+struct Packet { id: u64, summary: String, hex: String, detail: String, category: &'static str, info: String, protocol: u8, flow: Option<String> }
 fn matches_filter(packet: &Packet, filter: &str, search: &str) -> bool {
     let category_matches = match filter { "全部" => true, "TCP" => packet.protocol == 6, "UDP" => packet.protocol == 17, other => packet.category == other };
     category_matches && (search.is_empty() || packet.summary.to_lowercase().contains(search))
@@ -216,16 +239,49 @@ struct CaptureApp {
     compare_a: Option<(u64, Vec<u8>)>,
     compare_b: Option<(u64, Vec<u8>)>,
     payload_only: bool,
+    imported: bool,
+    skipped: u64,
+    show_flows: bool,
+    selected_flow: Option<String>,
 }
 impl CaptureApp {
     fn new(root: PathBuf) -> Self {
         let settings = Settings::load(&root.join("settings.ini"));
-        Self { folder: root.join("captures"), root, duration: "60".into(), ip: String::new(), log: String::new(), state: "准备就绪".into(), receiver: None, stop_file: None, last_file: None, packets: VecDeque::new(), packet_bytes: 0, packet_count: 0, selected: None, text_view: false, dns_cache: HashMap::new(), filter: "全部".into(), search: String::new(), show_log: false, show_settings: false, settings, show_compare: false, compare_a: None, compare_b: None, payload_only: false }
+        Self { folder: root.join("captures"), root, duration: "60".into(), ip: String::new(), log: String::new(), state: "准备就绪".into(), receiver: None, stop_file: None, last_file: None, packets: VecDeque::new(), packet_bytes: 0, packet_count: 0, selected: None, text_view: false, dns_cache: HashMap::new(), filter: "全部".into(), search: String::new(), show_log: false, show_settings: false, settings, show_compare: false, compare_a: None, compare_b: None, payload_only: false, imported: false, skipped: 0, show_flows: false, selected_flow: None }
     }
     fn report_status(&self, status: &str) {
         let file = self.last_file.as_ref().and_then(|p| p.file_name()).map(|p| p.to_string_lossy().into_owned());
         let value = serde_json::json!({"state":status,"file":file,"gui_pid":std::process::id()});
         let _ = fs::write(self.root.join("capture-status.json"), value.to_string());
+    }
+    fn push_packet(&mut self, id: u64, hex: &str) {
+        let bytes = decode_hex(hex);
+        let mut detail = format!("{} 字节", bytes.len());
+        let mut category = "其他";
+        let mut info_text = String::new();
+        if let Some(info) = metadata::parse(&bytes) {
+            if self.dns_cache.len() > 4096 { self.dns_cache.clear(); }
+            for (addr, domain) in info.dns_answers { self.dns_cache.insert(addr, domain); }
+            category = info.category; info_text = info.details; detail = info.description;
+            if let Some(host) = info.host { detail.push_str(&format!("  |  {host}")); info_text.push_str(&format!("\n{host}")); }
+            else if let Some(domain) = info.addresses.iter().find_map(|ip| self.dns_cache.get(ip)) { detail.push_str(&format!("  |  DNS 关联（可能不唯一）: {domain}")); info_text.push_str(&format!("\nDNS 关联（可能不唯一）：{domain}")); }
+        }
+        let summary = format!("#{id}  [{category}]  {detail}");
+        self.packet_bytes += hex.len();
+        self.packets.push_back(Packet { id, summary, hex: hex.to_owned(), detail, category, info: info_text, protocol: bytes.get(9).copied().unwrap_or(0), flow: pcap::flow_key(&bytes) });
+        if self.selected.is_none() { self.selected = Some(id); }
+        while self.packets.len() > self.settings.packet_limit || self.packet_bytes > 16 * 1024 * 1024 {
+            if let Some(old) = self.packets.pop_front() { self.packet_bytes -= old.hex.len(); if self.selected == Some(old.id) { self.selected = self.packets.front().map(|p| p.id); } }
+        }
+    }
+    fn open_capture(&mut self, path: PathBuf) {
+        let limit = self.settings.packet_limit;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::fs::File::open(&path).map_err(|e| e.to_string()).and_then(|f| pcap::load(std::io::BufReader::new(f), limit));
+            let _ = tx.send(Event::Imported(path, result));
+        });
+        self.state = "正在打开 PCAP…".into(); self.receiver = Some(rx);
     }
     fn start(&mut self) {
         let seconds: u32 = match self.duration.trim().parse() { Ok(n) if n <= 86400 => n, _ => { self.state = "时长请输入 0 到 86400 秒".into(); return; } };
@@ -252,7 +308,7 @@ impl CaptureApp {
             let _ = fs::remove_file(stop_for_thread);
             let _ = tx.send(Event::Finished(result));
         });
-        self.log.clear(); self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None; self.packet_bytes = 0; self.packet_count = 0; self.selected = None; self.state = "正在抓取热点转发流量…".into();
+        self.log.clear(); self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None; self.packet_bytes = 0; self.packet_count = 0; self.selected = None; self.selected_flow = None; self.imported = false; self.skipped = 0; self.state = "正在抓取热点转发流量…".into();
         self.last_file = Some(output); self.stop_file = Some(stop); self.receiver = Some(rx); self.report_status("capturing");
     }
     fn stop(&mut self) {
@@ -264,47 +320,46 @@ impl CaptureApp {
 impl eframe::App for CaptureApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         let mut finished = None;
+        let mut events = Vec::new();
         if let Some(rx) = &self.receiver {
-            while let Ok(event) = rx.try_recv() {
+            while let Ok(event) = rx.try_recv() { events.push(event); }
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        for event in events {
                 match event {
                     Event::Line(line) => {
                         if let Some(hex) = line.strip_prefix("PACKET_HEX:") {
                             self.packet_count += 1;
-                            let bytes = decode_hex(hex);
-                            let mut detail = format!("{} 字节", bytes.len());
-                            let mut category = "其他";
-                            let mut info_text = String::new();
-                            if let Some(info) = metadata::parse(&bytes) {
-                                if self.dns_cache.len() > 4096 { self.dns_cache.clear(); }
-                                for (addr, domain) in info.dns_answers { self.dns_cache.insert(addr, domain); }
-                                category = info.category;
-                                info_text = info.details;
-                                detail = info.description;
-                                if let Some(host) = info.host { detail.push_str(&format!("  |  {host}")); info_text.push_str(&format!("\n{host}")); }
-                                else if let Some(domain) = info.addresses.iter().find_map(|ip| self.dns_cache.get(ip)) { detail.push_str(&format!("  |  DNS 关联（可能不唯一）: {domain}")); info_text.push_str(&format!("\nDNS 关联（可能不唯一）：{domain}")); }
-                            }
-                            let summary = format!("#{}  [{}]  {}", self.packet_count, category, detail);
-                            self.packet_bytes += hex.len();
-                            self.packets.push_back(Packet { id: self.packet_count, summary, hex: hex.to_owned(), detail, category, info: info_text, protocol: bytes.get(9).copied().unwrap_or(0) });
-                            if self.selected.is_none() { self.selected = Some(self.packet_count); }
-                            while self.packets.len() > self.settings.packet_limit || self.packet_bytes > 16 * 1024 * 1024 {
-                                if let Some(old) = self.packets.pop_front() {
-                                    self.packet_bytes -= old.hex.len();
-                                    if self.selected == Some(old.id) { self.selected = self.packets.front().map(|p| p.id); }
-                                }
-                            }
+                            self.push_packet(self.packet_count, hex);
                         } else {
                             self.log.push_str(&line); self.log.push('\n');
                             if self.log.len() > 200_000 { self.log.clear(); }
                         }
                     },
-                    Event::Finished(s) => finished = Some(s)
+                    Event::Finished(s) => finished = Some(s),
+                    Event::Imported(path, result) => {
+                        self.receiver = None;
+                        match result {
+                            Ok(loaded) => {
+                                self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None;
+                                self.packet_bytes = 0; self.selected = None; self.selected_flow = None;
+                                self.packet_count = loaded.records; self.skipped = loaded.skipped; self.imported = true;
+                                self.last_file = Some(path);
+                                for (id, data) in loaded.packets {
+                                    use std::fmt::Write;
+                                    let mut hex = String::with_capacity(data.len() * 2);
+                                    for byte in data { let _ = write!(hex, "{byte:02X}"); }
+                                    self.push_packet(id, &hex);
+                                }
+                                self.state = "PCAP 已打开".into();
+                            },
+                            Err(error) => self.state = format!("打开 PCAP 失败: {error}"),
+                        }
+                    }
                 }
-            }
-            ctx.request_repaint_after(Duration::from_millis(250));
         }
         if let Some(s) = finished { let status = if s == "抓包完成" { "completed" } else { "failed" }; self.state = s; self.receiver = None; self.stop_file = None; self.report_status(status); }
-        if ctx.input(|i| i.viewport().close_requested()) && self.receiver.is_some() { self.stop(); self.report_status("stopping"); }
+        if ctx.input(|i| i.viewport().close_requested()) && self.stop_file.is_some() { self.stop(); self.report_status("stopping"); }
         let en = self.settings.english;
         let dark = self.settings.dark;
         let muted = if dark { Color32::from_rgb(159, 177, 197) } else { Color32::from_rgb(80, 100, 120) };
@@ -314,7 +369,7 @@ impl eframe::App for CaptureApp {
             let direction = ctx.input(|i| if i.key_pressed(egui::Key::ArrowDown) { 1 } else if i.key_pressed(egui::Key::ArrowUp) { -1 } else { 0 });
             if direction != 0 {
                 let search = self.search.to_lowercase();
-                let ids: Vec<u64> = self.packets.iter().filter(|p| matches_filter(p, &self.filter, &search)).map(|p| p.id).collect();
+                let ids: Vec<u64> = self.packets.iter().filter(|p| matches_filter(p, &self.filter, &search) && self.selected_flow.as_ref().map_or(true, |key| p.flow.as_ref() == Some(key))).map(|p| p.id).collect();
                 if !ids.is_empty() {
                     let current = self.selected.and_then(|id| ids.iter().position(|&x| x == id));
                     let index = match (current, direction) { (Some(i), 1) => (i + 1).min(ids.len() - 1), (Some(i), _) => i.saturating_sub(1), (None, _) => 0 };
@@ -329,7 +384,8 @@ impl eframe::App for CaptureApp {
                 ui.label(RichText::new(tr(en,"热点流量分析","Hotspot traffic analyzer")).color(muted)); ui.separator();
                 let start_button = egui::Button::new(RichText::new(tr(en,"开始抓包","Start capture")).strong().color(Color32::WHITE)).fill(Color32::from_rgb(0, 103, 192));
                 if ui.add_enabled(self.receiver.is_none(), start_button).clicked() { self.start(); }
-                if ui.add_enabled(self.receiver.is_some(), egui::Button::new(tr(en,"■ 停止并保存","■ Stop & save"))).clicked() { self.stop(); }
+                if ui.add_enabled(self.stop_file.is_some(), egui::Button::new(tr(en,"■ 停止并保存","■ Stop & save"))).clicked() { self.stop(); }
+                if ui.add_enabled(self.receiver.is_none(), egui::Button::new(tr(en,"打开 PCAP","Open PCAP"))).clicked() { if let Some(path) = choose_pcap() { self.open_capture(path); } }
                 ui.separator(); ui.label(tr(en,"时长（秒，0 不限）","Seconds (0 = unlimited)"));
                 ui.add_enabled(self.receiver.is_none(), egui::TextEdit::singleline(&mut self.duration).desired_width(55.0));
                 ui.label(tr(en,"手机 IPv4","Device IPv4"));
@@ -342,21 +398,25 @@ impl eframe::App for CaptureApp {
                 if ui.button(tr(en,"设置","Settings")).clicked() { self.show_settings = true; }
             });
             ui.horizontal(|ui| {
-                let state = if en { self.state.replace("准备就绪", "Ready").replace("正在抓取热点转发流量…", "Capturing forwarded hotspot traffic…").replace("正在停止并保存…", "Stopping and saving…").replace("抓包完成", "Capture complete").replace("抓包失败", "Capture failed").replace("启动失败", "Start failed").replace("停止失败", "Stop failed").replace("无法创建输出目录", "Cannot create output folder").replace("打开目录失败", "Cannot open folder").replace("时长请输入 0 到 86400 秒", "Duration must be 0–86400 seconds").replace("请输入有效的 IPv4 地址", "Enter a valid IPv4 address") } else { self.state.clone() };
+                let state = if en { self.state.replace("准备就绪", "Ready").replace("正在打开 PCAP…", "Opening PCAP…").replace("PCAP 已打开", "PCAP opened").replace("打开 PCAP 失败", "Could not open PCAP").replace("正在抓取热点转发流量…", "Capturing forwarded hotspot traffic…").replace("正在停止并保存…", "Stopping and saving…").replace("抓包完成", "Capture complete").replace("抓包失败", "Capture failed").replace("启动失败", "Start failed").replace("停止失败", "Stop failed").replace("无法创建输出目录", "Cannot create output folder").replace("打开目录失败", "Cannot open folder").replace("时长请输入 0 到 86400 秒", "Duration must be 0–86400 seconds").replace("请输入有效的 IPv4 地址", "Enter a valid IPv4 address") } else { self.state.clone() };
                 ui.label(RichText::new(state).color(if self.receiver.is_some() { if dark { Color32::from_rgb(70, 190, 125) } else { Color32::from_rgb(20, 120, 65) } } else { ui.visuals().text_color() }).strong());
-                if let Some(file) = &self.last_file { ui.separator(); ui.label(format!("{} {}", tr(en,"保存到：","Saved to:"), file.display())); }
+                if let Some(file) = &self.last_file { ui.separator(); ui.label(format!("{} {}", if self.imported { tr(en,"已打开：","Opened:") } else { tr(en,"保存到：","Saved to:") }, file.display())); }
             });
             ui.add_space(3.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!("{} {}  ·  {} {}", tr(en,"已捕获","Captured"), self.packet_count, tr(en,"窗口保留","In view"), self.packets.len()));
+                ui.label(format!("{} {}  ·  {} {}  ·  {} {}", if self.imported { tr(en,"文件记录","File records") } else { tr(en,"已捕获","Captured") }, self.packet_count, tr(en,"窗口保留","In view"), self.packets.len(), tr(en,"跳过非 IPv4","Non-IPv4 skipped"), self.skipped));
                 ui.separator(); ui.label(tr(en,"完整数据保存在 PCAP  ·  域名不能确定 App  ·  HTTPS 通常加密","Full capture saved to PCAP · Domains do not identify apps · HTTPS is usually encrypted"));
             });
         });
         egui::SidePanel::left("packets").resizable(true).default_width(455.0).min_width(330.0).show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| { ui.heading(tr(en,"数据包列表","Packets")); ui.label(RichText::new(format!("{} / {}", self.packets.len(), self.packet_count)).color(muted)); });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.show_flows, false, tr(en,"数据包","Packets"));
+                ui.selectable_value(&mut self.show_flows, true, tr(en,"连接","Connections"));
+            });
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("category").selected_text(local_category(en, &self.filter)).show_ui(ui, |ui| {
                     for category in ["全部", "DNS", "HTTP（可能）", "TLS/HTTPS（可能）", "UDP 443（可能为 QUIC）", "TCP", "UDP", "ICMP", "其他"] {
@@ -366,13 +426,39 @@ impl eframe::App for CaptureApp {
                 ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(160.0).hint_text(tr(en,"搜索 IP、端口、域名","Search IP, port, domain")));
                 if ui.button(tr(en,"清除","Clear")).clicked() { self.search.clear(); self.filter = "全部".into(); }
             });
-            ui.small(tr(en,"按类别、IP、端口或域名筛选 · 上下方向键切换","Filter by category, IP, port or domain · Use ↑/↓ to navigate"));
+            if let Some(key) = &self.selected_flow {
+                ui.label(RichText::new(format!("{} {key}", tr(en,"当前连接：","Connection:"))).color(muted));
+                if ui.button(tr(en,"显示所有连接","Show all connections")).clicked() { self.selected_flow = None; }
+            }
+            ui.small(tr(en,"连接统计仅基于窗口保留且符合筛选的数据包；NAT 可能拆分连接。","Connection totals cover retained, matching packets only; NAT may split a connection."));
             ui.separator();
             egui::ScrollArea::vertical().id_salt("packet_list").auto_shrink([false, false]).show(ui, |ui| {
                 let search = self.search.to_lowercase();
                 let mut shown = 0;
-                for packet in &self.packets {
+                if self.show_flows {
+                    let mut flows: HashMap<String, (usize, usize)> = HashMap::new();
+                    for packet in &self.packets {
+                        if !matches_filter(packet, &self.filter, &search) { continue; }
+                        if let Some(key) = &packet.flow { let entry = flows.entry(key.clone()).or_insert((0,0)); entry.0 += 1; entry.1 += packet.hex.len() / 2; }
+                    }
+                    let mut items: Vec<_> = flows.into_iter().collect();
+                    items.sort_by(|a,b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+                    for (key, (count, bytes)) in items {
+                        shown += 1;
+                        let response = egui::Frame::new().fill(card).inner_margin(egui::Margin::same(9)).corner_radius(5).show(ui, |ui| {
+                            ui.set_min_width((ui.available_width() - 20.0).max(180.0));
+                            ui.label(RichText::new(format!("{count} {}  ·  {bytes} B", tr(en,"包","packets"))).strong());
+                            ui.add(egui::Label::new(RichText::new(&key).size(12.5).color(muted)).truncate());
+                        });
+                        if response.response.interact(egui::Sense::click()).on_hover_text(&key).clicked() {
+                            self.selected_flow = Some(key.clone()); self.show_flows = false;
+                            self.selected = self.packets.iter().find(|p| p.flow.as_ref() == Some(&key) && matches_filter(p, &self.filter, &search)).map(|p| p.id);
+                        }
+                        ui.add_space(2.0);
+                    }
+                } else { for packet in &self.packets {
                     if !matches_filter(packet, &self.filter, &search) { continue; }
+                    if self.selected_flow.as_ref().map_or(false, |key| packet.flow.as_ref() != Some(key)) { continue; }
                     shown += 1;
                     let selected = self.selected == Some(packet.id);
                     let bg = if selected { selected_card } else { card };
@@ -387,7 +473,7 @@ impl eframe::App for CaptureApp {
                     });
                     if item.response.interact(egui::Sense::click()).on_hover_text(&packet.summary).clicked() { self.selected = Some(packet.id); }
                     ui.add_space(2.0);
-                }
+                }}
                 if shown == 0 { ui.label(tr(en,"没有匹配的数据包","No matching packets")); }
             });
         });
@@ -547,7 +633,7 @@ mod view_tests {
     }
     #[test]
     fn transport_filter_includes_specialized_categories() {
-        let packet = Packet { id: 1, summary: "HTTPS test".into(), hex: String::new(), detail: String::new(), category: "TLS/HTTPS（可能）", info: String::new(), protocol: 6 };
+        let packet = Packet { id: 1, summary: "HTTPS test".into(), hex: String::new(), detail: String::new(), category: "TLS/HTTPS（可能）", info: String::new(), protocol: 6, flow: None };
         assert!(matches_filter(&packet, "TCP", "https"));
         assert!(!matches_filter(&packet, "UDP", ""));
         assert!(matches_filter(&packet, "TLS/HTTPS（可能）", ""));

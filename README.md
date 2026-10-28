@@ -8,6 +8,7 @@ Windows hotspot packet capture and inspection with a Rust desktop interface, raw
 
 - Capture forwarded IPv4 traffic from devices connected to a Windows mobile hotspot; capture local traffic through the command-line tool.
 - Browse packets by protocol, search IP addresses, ports and visible domains, and inspect packet details.
+- Open classic PCAP files and browse retained packets grouped by connection.
 - View raw bytes as hex and ASCII or decode them as UTF-8; inspect TCP/UDP payloads separately.
 - Compare two raw IP packets byte by byte, including headers, and save captures as PCAP files.
 - Switch between light and dark themes, Chinese and English, and adjust scaling and data font size.
@@ -33,6 +34,8 @@ The repository includes the current Windows executables and required WinDivert b
 5. Click **Stop & save**, or wait for the duration to expire. PCAP files are saved under `captures/`.
 
 The **Settings** window controls language, theme, scaling, font size, and the number of packets retained in the interface. The on-screen list also has a 16 MiB limit; captured packets beyond that list remain in the PCAP file.
+
+Use **Open PCAP** to revisit a classic PCAP file. Raw IPv4 and Ethernet link types are supported; Ethernet headers are removed for inspection and non-IPv4 records are skipped. PCAPNG is not supported. For large files, the view retains only the newest packets within the configured packet and memory limits. The **Connections** tab groups retained packets by IP addresses, ports, and transport protocol. Its packet and byte totals cover only retained packets matching the current filters; NAT can split one conversation into multiple entries. Selecting a connection filters the packet list.
 
 ### Command line
 
@@ -130,6 +133,8 @@ Thanks to the [WinDivert project and its maintainers](https://github.com/basil00
 Hotspot Packet Inspector 捕获通过 Windows 移动热点转发的 IPv4 数据包，支持协议分类、地址和域名搜索、十六进制/ASCII 与 UTF-8 查看、单包字节对比和 PCAP 保存。
 
 **使用方法：**开启电脑移动热点并连接手机，运行 `PacketTool.exe`，允许管理员权限后点击“开始抓包”。选择数据包可查看内容；分别点击“设为 A”“设为 B”进行对比。抓包文件保存在 `captures/`；“设置”中可切换主题、语言、缩放和字号。
+
+点击“打开 PCAP”可以回看传统 PCAP 格式的 IPv4 原始包或以太网包（暂不支持 PCAPNG，会跳过非 IPv4 记录）。大文件只保留符合内存和数量限制的最新数据包。“连接”页按地址、端口和协议汇总当前窗口中符合筛选条件的包，点击连接可筛选其数据包；NAT 可能将同一通信拆成多个条目。
 
 **MCP：**同一个程序使用 `--mcp` 参数，以 stdio 提供抓包状态、文件列表、数据包读取和单包对比。配置示例见上方 [MCP integration](#mcp-integration)。
 
