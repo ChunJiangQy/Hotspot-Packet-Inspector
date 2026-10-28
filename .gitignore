@@ -1,0 +1,14 @@
+# Captures and local diagnostics can contain private traffic.
+captures/
+*.pcap
+*.pcapng
+*.log
+capture-status.json
+settings.ini
+mcp-config.json
+
+# Rust build artifacts and generated output.
+gui/target/
+reports/
+*.bin
+*.pdb
