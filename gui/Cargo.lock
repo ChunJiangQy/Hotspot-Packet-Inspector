@@ -1457,6 +1457,7 @@ name = "packet-tool-gui"
 version = "1.0.0"
 dependencies = [
  "eframe",
+ "memchr",
  "serde_json",
 ]
 

@@ -2,6 +2,8 @@
 mod metadata;
 mod mcp;
 mod pcap;
+mod search;
+mod stream;
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText};
 use std::fs;
@@ -147,7 +149,7 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     v.widgets.active.corner_radius = egui::CornerRadius::same(5);
     ctx.set_visuals(v);
 }
-fn local_category<'a>(en: bool, category: &'a str) -> &'a str {
+fn local_category(en: bool, category: &str) -> &str {
     if !en { return category; }
     match category { "全部" => "All", "HTTP（可能）" => "HTTP (possible)", "TLS/HTTPS（可能）" => "TLS/HTTPS (possible)", "UDP 443（可能为 QUIC）" => "UDP 443 (possible QUIC)", "其他" => "Other", _ => category }
 }
@@ -173,6 +175,18 @@ fn translate_detail(s: &str) -> String {
     text
 }
 struct Packet { id: u64, summary: String, hex: String, detail: String, category: &'static str, info: String, protocol: u8, flow: Option<String> }
+struct StreamView {
+    key: String,
+    stream: stream::Stream,
+    direction: usize,
+    page: usize,
+    text_view: bool,
+    search_query: String,
+    search_hex: bool,
+    results: Vec<usize>,
+    search_error: Option<String>,
+    jump: Option<usize>,
+}
 fn matches_filter(packet: &Packet, filter: &str, search: &str) -> bool {
     let category_matches = match filter { "全部" => true, "TCP" => packet.protocol == 6, "UDP" => packet.protocol == 17, other => packet.category == other };
     category_matches && (search.is_empty() || packet.summary.to_lowercase().contains(search))
@@ -243,11 +257,32 @@ struct CaptureApp {
     skipped: u64,
     show_flows: bool,
     selected_flow: Option<String>,
+    show_packet_search: bool,
+    packet_search_id: Option<u64>,
+    packet_search_bytes: Vec<u8>,
+    packet_search_base: usize,
+    packet_search_query: String,
+    packet_search_hex: bool,
+    packet_search_results: Vec<usize>,
+    packet_search_error: Option<String>,
+    packet_jump: Option<usize>,
+    show_stream: bool,
+    stream_view: Option<StreamView>,
+    stream_error: Option<String>,
 }
 impl CaptureApp {
     fn new(root: PathBuf) -> Self {
         let settings = Settings::load(&root.join("settings.ini"));
-        Self { folder: root.join("captures"), root, duration: "60".into(), ip: String::new(), log: String::new(), state: "准备就绪".into(), receiver: None, stop_file: None, last_file: None, packets: VecDeque::new(), packet_bytes: 0, packet_count: 0, selected: None, text_view: false, dns_cache: HashMap::new(), filter: "全部".into(), search: String::new(), show_log: false, show_settings: false, settings, show_compare: false, compare_a: None, compare_b: None, payload_only: false, imported: false, skipped: 0, show_flows: false, selected_flow: None }
+        Self { folder: root.join("captures"), root, duration: "60".into(), ip: String::new(), log: String::new(), state: "准备就绪".into(), receiver: None, stop_file: None, last_file: None, packets: VecDeque::new(), packet_bytes: 0, packet_count: 0, selected: None, text_view: false, dns_cache: HashMap::new(), filter: "全部".into(), search: String::new(), show_log: false, show_settings: false, settings, show_compare: false, compare_a: None, compare_b: None, payload_only: false, imported: false, skipped: 0, show_flows: false, selected_flow: None, show_packet_search: false, packet_search_id: None, packet_search_bytes: Vec::new(), packet_search_base: 0, packet_search_query: String::new(), packet_search_hex: false, packet_search_results: Vec::new(), packet_search_error: None, packet_jump: None, show_stream: false, stream_view: None, stream_error: None }
+    }
+    fn open_stream(&mut self, key: String) {
+        let packets: Vec<Vec<u8>> = self.packets.iter().filter(|p| p.flow.as_ref() == Some(&key)).map(|p| decode_hex(&p.hex)).collect();
+        self.stream_error = None;
+        match stream::build(&packets) {
+            Ok(stream) => self.stream_view = Some(StreamView { key, stream, direction: 0, page: 0, text_view: false, search_query: String::new(), search_hex: false, results: Vec::new(), search_error: None, jump: None }),
+            Err(e) => { self.stream_view = None; self.stream_error = Some(e); }
+        }
+        self.show_stream = true;
     }
     fn report_status(&self, status: &str) {
         let file = self.last_file.as_ref().and_then(|p| p.file_name()).map(|p| p.to_string_lossy().into_owned());
@@ -308,7 +343,7 @@ impl CaptureApp {
             let _ = fs::remove_file(stop_for_thread);
             let _ = tx.send(Event::Finished(result));
         });
-        self.log.clear(); self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None; self.packet_bytes = 0; self.packet_count = 0; self.selected = None; self.selected_flow = None; self.imported = false; self.skipped = 0; self.state = "正在抓取热点转发流量…".into();
+        self.log.clear(); self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None; self.show_stream = false; self.stream_view = None; self.show_packet_search = false; self.packet_search_id = None; self.packet_jump = None; self.packet_bytes = 0; self.packet_count = 0; self.selected = None; self.selected_flow = None; self.imported = false; self.skipped = 0; self.state = "正在抓取热点转发流量…".into();
         self.last_file = Some(output); self.stop_file = Some(stop); self.receiver = Some(rx); self.report_status("capturing");
     }
     fn stop(&mut self) {
@@ -341,7 +376,7 @@ impl eframe::App for CaptureApp {
                         self.receiver = None;
                         match result {
                             Ok(loaded) => {
-                                self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None;
+                                self.packets.clear(); self.dns_cache.clear(); self.compare_a = None; self.compare_b = None; self.show_stream = false; self.stream_view = None; self.show_packet_search = false; self.packet_search_id = None; self.packet_jump = None;
                                 self.packet_bytes = 0; self.selected = None; self.selected_flow = None;
                                 self.packet_count = loaded.records; self.skipped = loaded.skipped; self.imported = true;
                                 self.last_file = Some(path);
@@ -365,11 +400,11 @@ impl eframe::App for CaptureApp {
         let muted = if dark { Color32::from_rgb(159, 177, 197) } else { Color32::from_rgb(80, 100, 120) };
         let card = if dark { Color32::from_rgb(21, 29, 41) } else { Color32::WHITE };
         let selected_card = if dark { Color32::from_rgb(27, 65, 83) } else { Color32::from_rgb(215, 235, 248) };
-        if !ctx.wants_keyboard_input() && !self.show_settings && !self.show_compare && !self.show_log {
+        if !ctx.wants_keyboard_input() && !self.show_settings && !self.show_compare && !self.show_log && !self.show_packet_search && !self.show_stream {
             let direction = ctx.input(|i| if i.key_pressed(egui::Key::ArrowDown) { 1 } else if i.key_pressed(egui::Key::ArrowUp) { -1 } else { 0 });
             if direction != 0 {
                 let search = self.search.to_lowercase();
-                let ids: Vec<u64> = self.packets.iter().filter(|p| matches_filter(p, &self.filter, &search) && self.selected_flow.as_ref().map_or(true, |key| p.flow.as_ref() == Some(key))).map(|p| p.id).collect();
+                let ids: Vec<u64> = self.packets.iter().filter(|p| matches_filter(p, &self.filter, &search) && self.selected_flow.as_ref().is_none_or(|key| p.flow.as_ref() == Some(key))).map(|p| p.id).collect();
                 if !ids.is_empty() {
                     let current = self.selected.and_then(|id| ids.iter().position(|&x| x == id));
                     let index = match (current, direction) { (Some(i), 1) => (i + 1).min(ids.len() - 1), (Some(i), _) => i.saturating_sub(1), (None, _) => 0 };
@@ -458,7 +493,7 @@ impl eframe::App for CaptureApp {
                     }
                 } else { for packet in &self.packets {
                     if !matches_filter(packet, &self.filter, &search) { continue; }
-                    if self.selected_flow.as_ref().map_or(false, |key| packet.flow.as_ref() != Some(key)) { continue; }
+                    if self.selected_flow.as_ref().is_some_and(|key| packet.flow.as_ref() != Some(key)) { continue; }
                     shown += 1;
                     let selected = self.selected == Some(packet.id);
                     let bg = if selected { selected_card } else { card };
@@ -477,6 +512,7 @@ impl eframe::App for CaptureApp {
                 if shown == 0 { ui.label(tr(en,"没有匹配的数据包","No matching packets")); }
             });
         });
+        let mut requested_stream = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(packet) = self.packets.iter().find(|p| Some(p.id) == self.selected) {
                 ui.add_space(5.0);
@@ -515,6 +551,11 @@ impl eframe::App for CaptureApp {
                         if ui.button(tr(en,"设为 B","Set as B")).clicked() { self.compare_b = Some((packet.id, bytes.clone())); self.show_compare = true; }
                         if ui.button(tr(en,"复制十六进制","Copy hex bytes")).clicked() { ctx.copy_text(view_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")); }
                         if ui.button(tr(en,"复制当前视图","Copy view")).clicked() { ctx.copy_text(if self.text_view { render_text(view_bytes) } else { render_hex_at(view_bytes, view_offset) }); }
+                        if ui.button(tr(en,"搜索内容","Find bytes")).clicked() {
+                            self.packet_search_id = Some(packet.id); self.packet_search_bytes = view_bytes.to_vec(); self.packet_search_base = view_offset;
+                            self.packet_search_results.clear(); self.packet_search_error = None; self.show_packet_search = true;
+                        }
+                        if packet.protocol == 6 && packet.flow.is_some() && ui.button(tr(en,"查看 TCP 流","View TCP stream")).clicked() { requested_stream = packet.flow.clone(); }
                 });
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.text_view, false, tr(en,"十六进制 / ASCII","Hex / ASCII"));
@@ -527,7 +568,12 @@ impl eframe::App for CaptureApp {
                 else { ui.small(tr(en,"每行 16 字节：偏移量 | 十六进制字节 | ASCII（不可打印字符显示为 .）","16 bytes per row: offset | hexadecimal bytes | ASCII (non-printable bytes are .)")); }
                 ui.separator();
                 let content = if self.text_view { render_text(view_bytes) } else { render_hex_at(view_bytes, view_offset) };
-                egui::ScrollArea::both().id_salt("packet_content").auto_shrink([false, false]).show(ui, |ui| {
+                let mut scroll = egui::ScrollArea::both().id_salt("packet_content").auto_shrink([false, false]);
+                if let Some(offset) = self.packet_jump.take() {
+                    let line_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(self.settings.font_size)));
+                    scroll = scroll.vertical_scroll_offset(14.0 + ((offset / 16 + 1) as f32) * line_height);
+                }
+                scroll.show(ui, |ui| {
                     egui::Frame::new().fill(if dark { Color32::from_rgb(10, 16, 24) } else { Color32::WHITE }).inner_margin(egui::Margin::same(14)).corner_radius(5).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.add(egui::Label::new(RichText::new(content).monospace().size(self.settings.font_size).color(if dark { Color32::from_rgb(199, 218, 230) } else { Color32::from_rgb(35, 53, 69) })).selectable(true).wrap_mode(egui::TextWrapMode::Extend));
@@ -542,9 +588,101 @@ impl eframe::App for CaptureApp {
                 });
             }
         });
+        if let Some(key) = requested_stream { self.open_stream(key); }
         egui::Window::new(tr(en,"运行日志","Capture log")).open(&mut self.show_log).default_size([700.0, 400.0]).show(ctx, |ui| {
             egui::ScrollArea::both().stick_to_bottom(true).show(ui, |ui| { ui.label(RichText::new(&self.log).monospace()); });
         });
+        egui::Window::new(tr(en,"搜索数据包内容","Find in packet")).open(&mut self.show_packet_search).default_size([560.0, 360.0]).show(ctx, |ui| {
+            ui.label(format!("{} #{}  ·  {} {}  ·  {} 0x{:X}", tr(en,"数据包快照","Packet snapshot"), self.packet_search_id.unwrap_or(0), self.packet_search_bytes.len(), tr(en,"字节","bytes"), tr(en,"起始偏移","start offset"), self.packet_search_base));
+            ui.horizontal(|ui| {
+                if ui.selectable_value(&mut self.packet_search_hex, false, tr(en,"UTF-8 文本","UTF-8 text")).changed() { self.packet_search_results.clear(); self.packet_search_error = None; }
+                if ui.selectable_value(&mut self.packet_search_hex, true, tr(en,"十六进制","Hex")).changed() { self.packet_search_results.clear(); self.packet_search_error = None; }
+                if ui.add(egui::TextEdit::singleline(&mut self.packet_search_query).desired_width(200.0).hint_text(if self.packet_search_hex { "48 65 6C 6C 6F" } else { "text" })).changed() { self.packet_search_results.clear(); self.packet_search_error = None; }
+                if ui.button(tr(en,"搜索","Find")).clicked() {
+                    match search::query(&self.packet_search_query, self.packet_search_hex) {
+                        Ok(query) => { self.packet_search_results = search::find(&self.packet_search_bytes, &query, 200).into_iter().map(|n| n + self.packet_search_base).collect(); self.packet_search_error = None; },
+                        Err(e) => { self.packet_search_results.clear(); self.packet_search_error = Some(e.into()); }
+                    }
+                }
+            });
+            ui.small(tr(en,"按原始字节精确匹配；文本使用 UTF-8，最多显示 200 个结果。点击偏移跳转到完整包的十六进制视图。","Exact byte match; text uses UTF-8. Up to 200 results. Click an offset to jump to the full packet's hex view."));
+            if let Some(error) = &self.packet_search_error { ui.colored_label(Color32::from_rgb(190,60,50), error); }
+            ui.label(format!("{}: {}", tr(en,"结果","Results"), self.packet_search_results.len()));
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for &offset in &self.packet_search_results {
+                    if ui.link(format!("0x{offset:08X}")).clicked() {
+                        if self.packets.iter().any(|p| Some(p.id) == self.packet_search_id) {
+                            self.selected = self.packet_search_id; self.selected_flow = None; self.payload_only = false; self.text_view = false; self.packet_jump = Some(offset); ctx.request_repaint();
+                        } else { self.packet_search_error = Some(tr(en,"数据包已超出保留范围，请重新打开抓包文件。","Packet is no longer retained; reopen the capture.").into()); }
+                    }
+                }
+            });
+        });
+        let mut refresh_stream = None;
+        egui::Window::new(tr(en,"TCP 流重组","TCP stream reassembly")).open(&mut self.show_stream).default_size([900.0, 680.0]).show(ctx, |ui| {
+            if let Some(error) = &self.stream_error { ui.colored_label(Color32::from_rgb(190,60,50), error); }
+            if let Some(view) = &mut self.stream_view {
+                ui.label(&view.key);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{}: {}", tr(en,"快照数据包","Snapshot packets"), view.stream.packets));
+                    ui.label(format!("{}: {}", tr(en,"跳过分片","Skipped fragments"), view.stream.skipped_fragments));
+                    ui.label(format!("{}: {}", tr(en,"截断包","Truncated packets"), view.stream.truncated_packets));
+                    if ui.button(tr(en,"刷新快照","Refresh snapshot")).clicked() { refresh_stream = Some(view.key.clone()); }
+                });
+                ui.small(tr(en,"仅重组窗口当前保留且属于同一地址/端口组合的 TCP 包；不识别端口复用，无法知道流首尾是否完整。IP 分片不会重组，HTTPS 仍然加密。","Reassembles retained TCP packets with the same address/port tuple. Port reuse is not separated; stream boundaries may be incomplete. IP fragments are not reassembled; HTTPS stays encrypted."));
+                if view.stream.directions.is_empty() { ui.label(tr(en,"保留的数据包中没有可重组的 TCP 载荷。","No reassemblable TCP payload in retained packets.")); }
+                else {
+                    ui.horizontal_wrapped(|ui| {
+                        for (i,direction) in view.stream.directions.iter().enumerate() {
+                            if ui.selectable_value(&mut view.direction, i, &direction.label).changed() { view.page = 0; view.jump = Some(0); view.results.clear(); view.search_error = None; }
+                        }
+                    });
+                    let direction = &view.stream.directions[view.direction];
+                    ui.label(format!("{}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}  ·  TCP seq: {}", tr(en,"流长度","Stream span"), direction.data.len(), tr(en,"缺失字节","Missing bytes"), direction.missing, tr(en,"重传重叠字节","Overlapping bytes"), direction.retransmitted, tr(en,"冲突字节","Conflicting bytes"), direction.conflicts, direction.base_seq));
+                    ui.small(tr(en,"缺失显示为 ??；重叠冲突保留最先捕获的字节。偏移从第一个已知载荷字节起算。","Gaps are shown as ??; the first captured byte wins conflicts. Offsets start at the first known payload byte."));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.selectable_value(&mut view.search_hex, false, tr(en,"文本","Text")).changed() { view.results.clear(); view.search_error = None; }
+                        if ui.selectable_value(&mut view.search_hex, true, tr(en,"十六进制","Hex")).changed() { view.results.clear(); view.search_error = None; }
+                        if ui.add(egui::TextEdit::singleline(&mut view.search_query).desired_width(190.0).hint_text(if view.search_hex { "48 65 6C 6C 6F" } else { "UTF-8" })).changed() { view.results.clear(); view.search_error = None; }
+                        if ui.button(tr(en,"搜索流","Find in stream")).clicked() {
+                            match search::query(&view.search_query, view.search_hex) {
+                                Ok(query) => { view.results = search::find_sparse(&direction.data, &query, 200); view.search_error = None; },
+                                Err(error) => { view.results.clear(); view.search_error = Some(error.into()); }
+                            }
+                        }
+                        ui.label(format!("{}: {}", tr(en,"结果","Results"), view.results.len()));
+                    });
+                    if let Some(error) = &view.search_error { ui.colored_label(Color32::from_rgb(190,60,50), error); }
+                    if !view.results.is_empty() {
+                        ui.small(tr(en,"最多显示 200 个结果；点击偏移跳转。搜索不会跨越缺失数据。","Up to 200 results; click an offset to jump. Searches do not cross missing data."));
+                        egui::ScrollArea::horizontal().id_salt("stream_results").max_height(36.0).show(ui, |ui| { ui.horizontal(|ui| { for &offset in &view.results { if ui.link(format!("0x{offset:X}")).clicked() { view.page = offset / 8192; view.text_view = false; view.jump = Some(offset % 8192); } } }); });
+                    }
+                    const PAGE: usize = 8192;
+                    let pages = direction.data.len().saturating_add(PAGE-1) / PAGE;
+                    view.page = view.page.min(pages.saturating_sub(1));
+                    let start = view.page * PAGE;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(&mut view.text_view, false, tr(en,"十六进制 / ASCII","Hex / ASCII"));
+                        ui.selectable_value(&mut view.text_view, true, tr(en,"UTF-8 文本","UTF-8 text"));
+                        if ui.add_enabled(view.page > 0, egui::Button::new(tr(en,"上一页","Previous"))).clicked() { view.page -= 1; view.jump = Some(0); }
+                        if ui.add_enabled(view.page + 1 < pages, egui::Button::new(tr(en,"下一页","Next"))).clicked() { view.page += 1; view.jump = Some(0); }
+                        ui.label(format!("{} {}/{}  ·  0x{:X}", tr(en,"页","Page"), view.page + 1, pages.max(1), view.page * PAGE));
+                    });
+                    let start = if view.page * PAGE != start { view.page * PAGE } else { start };
+                    let content = if view.text_view { stream::text_page(&direction.data,start,PAGE) } else { stream::hex_page(&direction.data,start,PAGE) };
+                    if ui.button(tr(en,"复制当前页","Copy current page")).clicked() { ctx.copy_text(content.clone()); }
+                    let mut scroll = egui::ScrollArea::both().id_salt("stream_content").max_height(330.0);
+                    if let Some(offset) = view.jump.take() {
+                        let line_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(self.settings.font_size)));
+                        scroll = scroll.vertical_scroll_offset(((offset / 16 + 1) as f32) * line_height);
+                    }
+                    scroll.show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(content).monospace().size(self.settings.font_size)).selectable(true).wrap_mode(egui::TextWrapMode::Extend));
+                    });
+                }
+            }
+        });
+        if let Some(key) = refresh_stream { self.open_stream(key); }
         egui::Window::new(tr(en,"原始数据包字节对比","Raw packet byte comparison")).open(&mut self.show_compare).default_size([720.0, 560.0]).show(ctx, |ui| {
             ui.label(tr(en,"在数据包详情中选择“设为 A”和“设为 B”。对比包含 IP 和传输头，不会重组 TCP 流。","Choose Set as A and Set as B in packet details. Comparison includes IP/transport headers and does not reassemble TCP streams."));
             ui.horizontal(|ui| {
@@ -554,7 +692,7 @@ impl eframe::App for CaptureApp {
             if let (Some((_,a)), Some((_,b))) = (&self.compare_a, &self.compare_b) {
                 let common = a.len().min(b.len());
                 let differences: Vec<usize> = (0..common).filter(|&i| a[i] != b[i]).collect();
-                let first = differences.first().copied().or_else(|| if a.len() != b.len() { Some(common) } else { None });
+                let first = differences.first().copied().or(if a.len() != b.len() { Some(common) } else { None });
                 ui.separator();
                 ui.label(if a == b { tr(en,"两个数据包完全一致","Packets are identical").to_owned() } else { format!("{}: {}  ·  {}: {}  ·  {}: {}", tr(en,"首个差异偏移","First difference"), first.map(|n| format!("0x{n:X}")).unwrap_or_else(|| "—".into()), tr(en,"重叠部分不同字节","Different bytes in overlap"), differences.len(), tr(en,"多出的字节","Unmatched tail bytes"), a.len().abs_diff(b.len())) });
                 ui.small(tr(en,"显示前 200 个差异；偏移为十六进制。— 表示该包在此位置没有字节。","First 200 differences; offsets are hexadecimal. — means no byte at that offset."));

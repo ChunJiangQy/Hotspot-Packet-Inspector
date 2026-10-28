@@ -10,6 +10,8 @@ Windows hotspot packet capture and inspection with a Rust desktop interface, raw
 - Browse packets by protocol, search IP addresses, ports and visible domains, and inspect packet details.
 - Open classic PCAP files and browse retained packets grouped by connection.
 - View raw bytes as hex and ASCII or decode them as UTF-8; inspect TCP/UDP payloads separately.
+- Search packet contents or a reassembled TCP direction using exact UTF-8 or hexadecimal byte patterns.
+- Reassemble retained TCP packets by sequence number in each direction, with missing bytes and overlapping retransmissions identified.
 - Compare two raw IP packets byte by byte, including headers, and save captures as PCAP files.
 - Switch between light and dark themes, Chinese and English, and adjust scaling and data font size.
 - Connect MCP clients to read capture status, list captures, inspect packets, and compare packet bytes.
@@ -36,6 +38,10 @@ The repository includes the current Windows executables and required WinDivert b
 The **Settings** window controls language, theme, scaling, font size, and the number of packets retained in the interface. The on-screen list also has a 16 MiB limit; captured packets beyond that list remain in the PCAP file.
 
 Use **Open PCAP** to revisit a classic PCAP file. Raw IPv4 and Ethernet link types are supported; Ethernet headers are removed for inspection and non-IPv4 records are skipped. PCAPNG is not supported. For large files, the view retains only the newest packets within the configured packet and memory limits. The **Connections** tab groups retained packets by IP addresses, ports, and transport protocol. Its packet and byte totals cover only retained packets matching the current filters; NAT can split one conversation into multiple entries. Selecting a connection filters the packet list.
+
+Select a TCP packet and choose **View TCP stream** to inspect a snapshot of retained packets sharing its address/port tuple. Choose a direction, search its bytes, and click a match to jump to its page. Gaps are shown as `??`; conflicting overlaps retain the first captured byte. The view does not reassemble IP fragments or distinguish separate connections that reuse a tuple. The beginning and end may be incomplete, and each direction's sequence span is limited to 8 MiB. A snapshot does not update until refreshed. Search results are limited to 200 matches and cannot cross missing data. This is packet-level observation, not decryption.
+
+To search an individual packet, select its whole-packet or payload-only view and choose **Find bytes**. UTF-8 text and hexadecimal patterns are exact, case-sensitive byte searches. Clicking a result jumps to its offset in the full packet's hex view.
 
 ### Command line
 
@@ -133,6 +139,8 @@ Thanks to the [WinDivert project and its maintainers](https://github.com/basil00
 Hotspot Packet Inspector 捕获通过 Windows 移动热点转发的 IPv4 数据包，支持协议分类、地址和域名搜索、十六进制/ASCII 与 UTF-8 查看、单包字节对比和 PCAP 保存。
 
 **使用方法：**开启电脑移动热点并连接手机，运行 `PacketTool.exe`，允许管理员权限后点击“开始抓包”。选择数据包可查看内容；分别点击“设为 A”“设为 B”进行对比。抓包文件保存在 `captures/`；“设置”中可切换主题、语言、缩放和字号。
+
+选择 TCP 数据包后点击“查看 TCP 流”，可按方向重组当前保留的同一地址和端口组合的数据，并以 UTF-8 文本或十六进制搜索。缺失字节显示为 `??`，重传冲突保留先捕获的字节；不重组 IP 分片，也不区分复用同一地址和端口的不同连接。流可能缺少开头或结尾，单方向跨度上限为 8 MiB，抓包期间须手动刷新快照。单包可通过“搜索内容”查找。搜索是区分大小写的精确字节匹配，最多显示 200 个结果，不会跨越缺失片段，也不会解密 HTTPS。
 
 点击“打开 PCAP”可以回看传统 PCAP 格式的 IPv4 原始包或以太网包（暂不支持 PCAPNG，会跳过非 IPv4 记录）。大文件只保留符合内存和数量限制的最新数据包。“连接”页按地址、端口和协议汇总当前窗口中符合筛选条件的包，点击连接可筛选其数据包；NAT 可能将同一通信拆成多个条目。
 

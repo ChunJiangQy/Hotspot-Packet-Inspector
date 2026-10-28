@@ -72,7 +72,7 @@ fn tool(root: &Path, name: &str, a: &Value) -> Result<Value, String> {
             let left = named_packet(root, f1, n1)?; let right = named_packet(root, f2, n2)?;
             let common = left.len().min(right.len());
             let changes: Vec<usize> = (0..common).filter(|&i| left[i] != right[i]).collect();
-            let first = changes.first().copied().or_else(|| if left.len() != right.len() { Some(common) } else { None });
+            let first = changes.first().copied().or(if left.len() != right.len() { Some(common) } else { None });
             Ok(json!({"length_a":left.len(),"length_b":right.len(),"equal":left == right,"first_difference_offset":first,"different_bytes_in_overlap":changes.len(),"unmatched_tail_bytes":left.len().abs_diff(right.len()),"first_difference_offsets":changes.into_iter().take(32).collect::<Vec<_>>(),"note":"Compares raw IP packets including headers; not TCP stream reassembly."}))
         }
         _ => Err("unknown tool".into())

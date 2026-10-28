@@ -128,7 +128,7 @@ pub fn parse(packet: &[u8]) -> Option<Info> {
             else if sp == 80 || dp == 80 || sp == 8080 || dp == 8080 { category = "HTTP（可能）"; }
             if let Some(sni) = tls_sni(payload) { category = "TLS/HTTPS（可能）"; host = Some(format!("TLS SNI: {sni}")); }
             else if let Ok(text) = std::str::from_utf8(payload) {
-                if let Some(line) = text.lines().find(|line| line.get(..5).map_or(false, |prefix| prefix.eq_ignore_ascii_case("host:"))) {
+                if let Some(line) = text.lines().find(|line| line.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("host:"))) {
                     category = "HTTP（可能）";
                     host = Some(format!("HTTP Host: {}", line[5..].trim()));
                 }
